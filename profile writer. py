@@ -1,0 +1,257 @@
+####INSTALL DEPENDENCIES
+
+pip install langgraph langchain-groq langchain-core python-dotenv
+
+####SETTING GROQ API KEY
+
+GROQ_API_KEY="groq_api_key"
+
+####WRITE STATE.py
+
+
+%%writefile agent_state.py
+from typing import TypedDict, List, Optional
+
+class AgentState(TypedDict, total=False):
+    request: str
+    context: str
+    content_type: str
+    custom_label: Optional[str]
+    num_variations: int
+    outputs: List[str]
+
+# ####WRITE PROMPTS.py
+
+
+%%writefile prompts.py
+HUMANIZE_RULES = """
+Write like a real person typing this themselves, not marketing copy or an AI assistant.
+- No buzzwords: "game-changer", "unlock", "leverage", "seamless", "passionate about",
+  "in today's fast-paced world", "dive into", "cutting-edge", "in conclusion".
+- At most ONE emoji, only if it truly fits. Zero is usually better.
+- One exclamation point max, only if earned.
+- Vary sentence length on purpose — mix short and long.
+- Be concrete ("cut load time from 4s to 900ms") instead of vague ("significantly improved").
+- Contractions are fine (I'm, don't, it's).
+"""
+
+def build_variation_instruction(n: int) -> str:
+    return (
+        f"Generate {n} genuinely different versions (different angle/structure, not just "
+        f"reworded synonyms). Separate each with a line: ---VERSION {{i}}---  "
+        f"(replace {{i}} with the version number, 1 through {n})."
+    )
+
+README_TEMPLATE = """You are writing a GitHub profile/project README.
+Context: {context}
+{humanize_rules}
+- Short intro about who they are / what they build
+- What they're currently working on
+- Tech stack, written naturally
+- A project worth highlighting and why it mattered
+- How to reach them, if relevant
+Output clean Markdown, no surrounding code block.
+{variation_instruction}
+"""
+
+LINKEDIN_POST_TEMPLATE = """You are writing a LinkedIn post.
+Context: {context}
+{humanize_rules}
+- Open with a real hook, not "Excited to announce..."
+- Short paragraphs, 1-3 sentences, line breaks (mobile-readable)
+- End with something that invites a genuine response
+- Roughly 80-180 words unless context calls for more
+{variation_instruction}
+"""
+
+LINKEDIN_ABOUT_TEMPLATE = """You are writing a LinkedIn "About" section.
+Context: {context}
+{humanize_rules}
+- First person, conversational
+- Open with what they care about/do, not their job title
+- Concrete specifics over adjectives
+- End with what they're open to, if relevant
+- Roughly 100-220 words
+{variation_instruction}
+"""
+
+LINKEDIN_HEADLINE_TEMPLATE = """You are writing LinkedIn headlines (~220 characters).
+Context: {context}
+{humanize_rules}
+- Not just "Job Title at Company"
+- Say what they actually do, understandable in 2 seconds
+- Vary structure across the 5 versions
+- Under 220 characters each
+- After the 5 headlines, add "Why headlines work" — 3-4 plain-language sentences of advice
+{variation_instruction}
+"""
+
+CUSTOM_TEMPLATE = """You are writing: {content_type}
+Context: {context}
+{humanize_rules}
+Match the natural conventions and length of this content type.
+{variation_instruction}
+"""
+
+ROUTER_SYSTEM_PROMPT = """Classify this request into exactly one label, output only the label:
+readme | linkedin_post | linkedin_about | linkedin_headline | custom
+
+Request: {request}
+"""
+
+# ####WRITE GRAPH.py
+
+
+%%writefile graph.py
+import os
+import re
+from typing import List
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, END
+
+from agent_state import AgentState
+import prompts
+
+def get_llm(temperature: float = 0.9) -> ChatGroq:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file.")
+    return ChatGroq(
+        model="llama-3.3-70b-versatile",
+        temperature=temperature,
+        groq_api_key=api_key,
+    )
+
+def parse_versions(raw_text: str, expected: int) -> List[str]:
+    parts = re.split(r"---\s*VERSION\s*\d+\s*---", raw_text, flags=re.IGNORECASE)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) >= expected:
+        return parts[:expected]
+    return parts if parts else [raw_text.strip()]
+
+def route_request(state: AgentState) -> AgentState:
+    if state.get("content_type"):
+        return state
+    llm = get_llm(temperature=0)
+    prompt = prompts.ROUTER_SYSTEM_PROMPT.format(request=state["request"])
+    label = llm.invoke(prompt).content.strip().lower()
+    valid = {"readme", "linkedin_post", "linkedin_about", "linkedin_headline", "custom"}
+    state["content_type"] = label if label in valid else "custom"
+    if state["content_type"] == "custom":
+        state["custom_label"] = state.get("request", "personal branding content")
+    return state
+
+def route_decision(state: AgentState) -> str:
+    return state["content_type"]
+
+def _run_generator(template: str, state: AgentState, **extra) -> AgentState:
+    n = state.get("num_variations", 5)
+    llm = get_llm(temperature=0.95)
+    prompt = template.format(
+        context=state.get("context", "").strip() or "(no extra context given)",
+        humanize_rules=prompts.HUMANIZE_RULES,
+        variation_instruction=prompts.build_variation_instruction(n),
+        **extra,
+    )
+    result = llm.invoke(prompt)
+    state["outputs"] = parse_versions(result.content, n)
+    return state
+
+def generate_readme(state): return _run_generator(prompts.README_TEMPLATE, state)
+def generate_linkedin_post(state): return _run_generator(prompts.LINKEDIN_POST_TEMPLATE, state)
+def generate_linkedin_about(state): return _run_generator(prompts.LINKEDIN_ABOUT_TEMPLATE, state)
+def generate_linkedin_headline(state): return _run_generator(prompts.LINKEDIN_HEADLINE_TEMPLATE, state)
+def generate_custom(state):
+    label = state.get("custom_label") or "personal branding content"
+    return _run_generator(prompts.CUSTOM_TEMPLATE, state, content_type=label)
+
+def build_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("router", route_request)
+    graph.add_node("readme", generate_readme)
+    graph.add_node("linkedin_post", generate_linkedin_post)
+    graph.add_node("linkedin_about", generate_linkedin_about)
+    graph.add_node("linkedin_headline", generate_linkedin_headline)
+    graph.add_node("custom", generate_custom)
+
+    graph.set_entry_point("router")
+    graph.add_conditional_edges("router", route_decision, {
+        "readme": "readme",
+        "linkedin_post": "linkedin_post",
+        "linkedin_about": "linkedin_about",
+        "linkedin_headline": "linkedin_headline",
+        "custom": "custom",
+    })
+    for node in ["readme", "linkedin_post", "linkedin_about", "linkedin_headline", "custom"]:
+        graph.add_edge(node, END)
+    return graph.compile()
+
+# ####RUN IT
+
+
+#import os
+from dotenv import load_dotenv
+import importlib
+import graph
+
+importlib.reload(graph)
+from graph import build_graph
+
+load_dotenv()
+
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
+MENU = """
+What do you want written?
+  1) GitHub README
+  2) LinkedIn post
+  3) LinkedIn About section
+  4) LinkedIn headline
+  5) Something else (describe it)
+  0) Quit
+"""
+CONTENT_TYPE_BY_CHOICE = {
+    "1": "readme", "2": "linkedin_post", "3": "linkedin_about", "4": "linkedin_headline",
+}
+
+def get_context() -> str:
+    print("\nPaste your context (role, project, story, tone). Press Enter twice to finish:\n")
+    lines = []
+    while True:
+        line = input()
+        if line == "" and (not lines or lines[-1] == ""):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+def main():
+    app = build_graph()
+    while True:
+        print(MENU)
+        choice = input("Choose an option: ").strip()
+        if choice == "0":
+            break
+
+        state = {"num_variations": 5}
+        if choice in CONTENT_TYPE_BY_CHOICE:
+            state["content_type"] = CONTENT_TYPE_BY_CHOICE[choice]
+            state["context"] = get_context()
+        elif choice == "5":
+            state["request"] = input("\nDescribe what you want written: ").strip()
+            state["context"] = get_context()
+        else:
+            print("Not a valid option.")
+            continue
+
+        print("\nGenerating 5 options...\n")
+        try:
+            result = app.invoke(state)
+        except Exception as e:
+            print(f"Error: {e}")
+            continue
+
+        for i, text in enumerate(result.get("outputs", []), 1):
+            print(f"\n{'='*60}\nOPTION {i}\n{'='*60}\n{text}")
+
+if __name__ == "__main__":
+    main()
